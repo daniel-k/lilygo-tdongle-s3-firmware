@@ -53,6 +53,7 @@
 #include "gud/gud_usb.h"
 #include "gud/gud_display.h"
 #include "msc_sd.h"
+#include "hid_button.h"
 #endif
 
 static const char *TAG = "USB_BT_HCI";
@@ -78,6 +79,7 @@ static const char *TAG = "USB_BT_HCI";
  *   IF1       BT SCO:     no endpoints (dummy, satisfies btusb's N+1 quirk)
  *   IF2       MSC:        EP3 IN/OUT bulk
  *   IF3       GUD vendor: EP5 OUT bulk
+ *   IF4       HID:        EP4 IN interrupt
  *
  * Super Mini build (BT-only):
  *   IF0       BT HCI:     EP1 IN interrupt, EP2 IN/OUT bulk
@@ -89,6 +91,10 @@ static const char *TAG = "USB_BT_HCI";
  * driver owns IF0 — which then stalls EP0 and the host gives up with
  * EPIPE on opcode 0x0c03 (HCI Reset). MSC at IF2 is fine on any modern
  * UEFI (the boot stack walks all interfaces looking for class 0x08).
+ *
+ * The T-Dongle build uses 5 IN endpoints (EP0 + EP1 + EP2 + EP3 + EP4),
+ * which fills all five TX FIFOs the ESP32-S3 USB-OTG core provides — no
+ * further IN endpoints can be added without dropping one.
  */
 #define EP_EVT_IN       0x81  /* Interrupt IN  - HCI events */
 #define EP_ACL_IN       0x82  /* Bulk IN       - ACL data to host */
@@ -96,8 +102,10 @@ static const char *TAG = "USB_BT_HCI";
 #ifdef BOARD_T_DONGLE_S3
 #define EP_MSC_IN       0x83  /* Bulk IN       - SCSI READ  responses */
 #define EP_MSC_OUT      0x03  /* Bulk OUT      - SCSI WRITE payloads  */
+#define EP_HID_IN       0x84  /* Interrupt IN  - BOOT button HID reports */
 #define EP_GUD_OUT      0x05  /* Bulk OUT      - framebuffer transfers */
 #define EP_MSC_SIZE     64
+#define EP_HID_SIZE     8
 #endif
 
 #define EP_EVT_SIZE   16
@@ -111,6 +119,7 @@ enum {
     STRID_SERIAL,
 #ifdef BOARD_T_DONGLE_S3
     STRID_GUD,
+    STRID_HID,
 #endif
 };
 
@@ -120,7 +129,7 @@ enum {
 
 /* Composite device. Class = Miscellaneous / Common / IAD so the host
  * parses the IAD(s) to find the separate functions.
- *   T-Dongle S3 build: BT (IF0+IF1) + MSC (IF2) + GUD (IF3).
+ *   T-Dongle S3 build: BT (IF0+IF1) + MSC (IF2) + GUD (IF3) + HID (IF4).
  *   Super Mini build:  BT (IF0+IF1) only. */
 static tusb_desc_device_t const desc_device = {
     .bLength            = sizeof(tusb_desc_device_t),
@@ -149,13 +158,15 @@ static tusb_desc_device_t const desc_device = {
  * [T-Dongle only:]
  * + MSC iface (9) + 2 EPs (14)
  * + GUD IAD (8) + iface (9) + 1 EP (7)
+ * + HID iface (9) + HID class desc (9) + 1 EP (7)
  */
 #ifdef BOARD_T_DONGLE_S3
-#define NUM_INTERFACES    4
+#define NUM_INTERFACES    5
 #define CONFIG_TOTAL_LEN  (TUD_CONFIG_DESC_LEN \
                            + 8 + 9 + 21 + 9 \
                            + 9 + 14 \
-                           + 8 + 9 + 7)
+                           + 8 + 9 + 7 \
+                           + 9 + 9 + 7)
 #else
 #define NUM_INTERFACES    2
 #define CONFIG_TOTAL_LEN  (TUD_CONFIG_DESC_LEN \
@@ -230,6 +241,25 @@ static uint8_t const desc_configuration[] = {
     /* EP5 OUT - Bulk (framebuffer pixels from host) */
     7, TUSB_DESC_ENDPOINT, EP_GUD_OUT,
     TUSB_XFER_BULK, U16_TO_U8S_LE(GUD_BULK_OUT_SIZE), 0,
+
+    /* Interface 4: HID (Generic Desktop / Game Pad with one button).
+     * Bare interface — no IAD needed. Bridges the BOOT button (GPIO0)
+     * to the host as a generic input device; Linux surfaces it as
+     * /dev/input/eventN reporting BTN_TRIGGER. */
+    9, TUSB_DESC_INTERFACE, 4 /* itf# */, 0 /* alt */, 1 /* nEPs */,
+    TUSB_CLASS_HID, 0 /* not boot */, 0 /* report protocol */, STRID_HID,
+
+    /* HID class descriptor */
+    9, HID_DESC_TYPE_HID,
+    U16_TO_U8S_LE(0x0111),               /* bcdHID 1.11 */
+    0 /* country code */, 1 /* num descriptors */,
+    HID_DESC_TYPE_REPORT,
+    U16_TO_U8S_LE(HID_REPORT_DESC_LEN),
+
+    /* EP4 IN - Interrupt (HID input reports) */
+    7, TUSB_DESC_ENDPOINT, EP_HID_IN,
+    TUSB_XFER_INTERRUPT, U16_TO_U8S_LE(EP_HID_SIZE),
+    10 /* poll interval ms */,
 #endif /* BOARD_T_DONGLE_S3 */
 };
 
@@ -237,16 +267,22 @@ static char const *string_desc_arr[] = {
     "",
     "Espressif",
 #ifdef BOARD_T_DONGLE_S3
-    "ESP32-S3 BT HCI + MSC + GUD",
+    "ESP32-S3 BT HCI + MSC + GUD + HID",
 #else
     "ESP32-S3 BT HCI",
 #endif
     "000001",
 #ifdef BOARD_T_DONGLE_S3
     "ESP32-S3 GUD Display",
+    "ESP32-S3 BOOT button",
 #endif
 };
-static uint16_t _desc_str[33];
+/* Buffer for UTF-16 string descriptors. Element 0 is the descriptor header
+ * (bLength + bDescriptorType); the rest hold UTF-16 chars. Sized for up to
+ * 63 chars + 1 header — well under the USB hard limit of 126 chars per
+ * string descriptor (bLength is a single byte). */
+#define DESC_STR_MAX_CHARS  63
+static uint16_t _desc_str[DESC_STR_MAX_CHARS + 1];
 
 uint8_t const *tud_descriptor_device_cb(void) { return (uint8_t const *)&desc_device; }
 uint8_t const *tud_descriptor_configuration_cb(uint8_t index) { (void)index; return desc_configuration; }
@@ -259,7 +295,7 @@ uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
         if (index >= sizeof(string_desc_arr) / sizeof(string_desc_arr[0])) return NULL;
         const char *str = string_desc_arr[index];
         chr_count = strlen(str);
-        if (chr_count > 31) chr_count = 31;
+        if (chr_count > DESC_STR_MAX_CHARS) chr_count = DESC_STR_MAX_CHARS;
         for (uint8_t i = 0; i < chr_count; i++) _desc_str[1 + i] = str[i];
     }
     _desc_str[0] = (uint16_t)((TUSB_DESC_STRING << 8) | (2 * chr_count + 2));
@@ -790,6 +826,11 @@ void app_main(void)
                                              MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
     ESP_ERROR_CHECK(gud_framebuffer ? ESP_OK : ESP_ERR_NO_MEM);
     gud_driver_setup(&gud_display_cfg, gud_framebuffer, NULL);
+
+    /* Configure GPIO0 (BOOT button) and start the HID polling task that
+     * sends one-byte reports on press / release. The task runs whether
+     * USB is up or not; tud_hid_ready() guards against pre-mount sends. */
+    hid_button_init();
 #endif
 
     /* Diagnostic: log boot context so dmesg/CDC capture shows whether ROM

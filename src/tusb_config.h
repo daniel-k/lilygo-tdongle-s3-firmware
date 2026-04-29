@@ -15,10 +15,16 @@
  * TinyUSB MSC callbacks. */
 #define CFG_TUD_MSC              1
 #define CFG_TUD_MSC_EP_BUFSIZE   512
+/* USB HID single-button gamepad bridging the T-Dongle's BOOT button
+ * (GPIO0) to the host. Endpoint buffer is plenty for our 1-byte input
+ * report; CFG_TUD_HID=1 enables the built-in TinyUSB HID class driver
+ * whose callbacks live in src/hid_button.c. */
+#define CFG_TUD_HID              1
+#define CFG_TUD_HID_EP_BUFSIZE   8
 #else
 #define CFG_TUD_MSC              0
-#endif
 #define CFG_TUD_HID              0
+#endif
 #define CFG_TUD_MIDI             0
 #define CFG_TUD_VENDOR           0
 #define CFG_TUD_ECM_RNDIS        0

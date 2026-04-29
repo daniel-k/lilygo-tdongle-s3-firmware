@@ -10,11 +10,14 @@ Two PlatformIO build envs in `platformio.ini`:
 
 Function-specific code (MSC, GUD) is gated by `#ifdef BOARD_T_DONGLE_S3` in `src/main.c`, `src/tusb_config.h`, `src/msc_sd.c`, and every `src/gud/*.c` so the Super Mini binary doesn't drag in the SDMMC/SPI panel/GUD class driver. Net ~96 KB smaller.
 
-USB layout, T-Dongle build (4 interfaces, two IADs):
+USB layout, T-Dongle build (5 interfaces, two IADs):
 - IF0: BT HCI (class 0xE0/0x01/0x01), 3 endpoints
 - IF1: dummy SCO (class 0xE0/0x01/0x01), 0 endpoints — satisfies btusb's N+1 quirk
 - IF2: MSC (class 0x08/0x06/0x50), 2 bulk endpoints — backed by µSD
 - IF3: GUD vendor (class 0xFF), 1 bulk OUT endpoint
+- IF4: HID (class 0x03), 1 interrupt IN endpoint — BOOT button (GPIO0) as 1-button gamepad
+
+This fills all 5 TX FIFOs that ESP32-S3 USB-OTG provides (EP0 + 4 IN endpoints). No further IN endpoints can be added on this build without dropping one.
 
 USB layout, Super Mini build (2 interfaces, one IAD): just IF0+IF1 from the above.
 
@@ -76,6 +79,7 @@ Run `tools/reboot-download.py` — its VBUS-cycle fallback brings the chip back.
 - **BT HCI**: `bluetoothctl list` shows the dongle as a controller with manufacturer 0x02e5 (Espressif). `dmesg.log` lists `Bluetooth: MGMT ver` after enumeration. The hciN index depends on what other controllers are present.
 - **MSC** (T-Dongle only): `lsblk` shows `/dev/sdX`, GNOME/udisks auto-mounts FAT partitions to `/run/media/$USER/`. dmesg shows `usb-storage 3-1.X:1.2: USB Mass Storage device detected`.
 - **GUD** (T-Dongle only): The host's `gud` driver auto-binds to IF3 (matches `1d50:614d` in its static id_table). `tools/draw-text.py -t "..."` is the easiest end-to-end smoke test — it claims IF3 via libusb, sends the GUD setup sequence, renders text via Pillow, and pushes a single SET_BUFFER + bulk OUT. ~33 ms wall time. Requires gud to NOT be bound to IF3 (libusb claim conflicts with kernel driver). If gud is bound, unbind: `echo '<port>:1.3' | sudo tee /sys/bus/usb/drivers/gud/unbind`.
+- **HID button** (T-Dongle only): `usbhid` auto-binds IF4. dmesg should show `hid-generic ... USB HID v1.11 Gamepad`. Linux's hid-input.c maps Generic Desktop / Game Pad / Button-1 to evdev `BTN_A` (also called `BTN_GAMEPAD` / `BTN_SOUTH`, code 0x130) — NOT `BTN_TRIGGER` despite the gamepad-with-one-button shape. `/dev/input/jsN` is also created. Test physically by pressing BOOT and watching `evtest /dev/input/eventN` (needs input-group access or root) or `jstest /dev/input/jsN` (typically world-readable).
 - `modetest -M gud` enumerates the connector. `modetest -M gud -s <conn>@<crtc>:80x160` (from a TTY or with mutter killed) draws a test pattern via real DRM atomic — but Linux 6.19 has a NULL-deref in `gud_plane_atomic_update` when modetest exits cleanly (TODO #2).
 - The DRM card is exposed as **non-desktop** via a Microsoft VSDB in our EDID, so GNOME / mutter ignore it. As a side effect there is **no `/dev/fbN`** for our card: `drm_fb_helper` filters non-desktop connectors out of fbdev-emulation, so plug-in dmesg always shows `gud …: [drm] Cannot find any crtc or sizes` (twice — that's expected, not a bug). Use `/dev/dri/cardN` directly (modetest, libdrm) or `tools/draw-text.py` (libusb, bypasses the kernel driver entirely).
 
@@ -83,6 +87,7 @@ Run `tools/reboot-download.py` — its VBUS-cycle fallback brings the chip back.
 
 - `src/main.c` — BT HCI bridge, USB descriptors, TinyUSB class driver registration, app_main. Conditional code blocks gated by `BOARD_T_DONGLE_S3`.
 - `src/msc_sd.{c,h}` — SDMMC slot 1 (4-bit) bridge to TinyUSB MSC class. T-Dongle only (entire .c body is `#ifdef BOARD_T_DONGLE_S3`).
+- `src/hid_button.{c,h}` — HID gamepad bridge for GPIO0 (BOOT button). T-Dongle only. Owns the TinyUSB `tud_hid_*_cb` callbacks (CFG_TUD_HID=1 in tusb_config.h enables the built-in HID class driver).
 - `src/gud/` — GUD function. T-Dongle only. `gud.{c,h}` lifted verbatim from notro/gud-pico (MIT). `gud_usb.{c,h}` adapted from gud-pico's driver.c. `gud_display.{c,h}` is the T-Dongle ST7735 backend (SPI panel + LEDC backlight + write_buffer_cb byte-swap). `gud_edid_ext.{c,h}` builds the 256-byte EDID with Microsoft non-desktop VSDB. `esp_lcd_st7735.{c,h}` lifted verbatim from LilyGo T-Dongle-S3 (MIT). All .c files wrapped in `#ifdef BOARD_T_DONGLE_S3`.
 - `tools/` for host-side scripts: `reboot-download.py` (autonomous flash), `draw-text.py` (end-to-end smoke test).
 - `udev/80-esp32s3-hci-dev.rules` for libusb + per-port disable access.

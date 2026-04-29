@@ -1,7 +1,7 @@
 # LilyGo T-Dongle S3 firmware
 
 Turns a [LilyGo T-Dongle S3](https://lilygo.cc/products/t-dongle-s3) into a
-USB composite device that exposes the dongle's onboard hardware as three
+USB composite device that exposes the dongle's onboard hardware as four
 standard USB functions:
 
 - **Bluetooth HCI controller** — the ESP32-S3's BLE controller, presented
@@ -13,11 +13,15 @@ standard USB functions:
 - **Generic USB Display** — the 0.96" 80×160 ST7735 LCD driven via the
   in-tree Linux [`gud`](https://github.com/notro/gud) driver
   (`/dev/dri/cardN`).
+- **HID gamepad** — the BOOT button (GPIO0) bridged to the host as a
+  single-button gamepad (`/dev/input/eventN` + `/dev/input/jsN`,
+  reporting `BTN_A` on press / release). Lets you wire the button to
+  arbitrary host actions via `udev` / `uinput` / `evtest`.
 
-When plugged into a recent Linux host with no special configuration, all
-three Just Work: `btusb` binds the HCI half, `usb-storage` binds the
-storage interface, and `gud` binds the display interface. No `new_id`,
-no kernel patches, no manual unbinds.
+When plugged into a recent Linux host with no special configuration,
+all four Just Work: `btusb` binds the HCI half, `usb-storage` binds the
+storage interface, `gud` binds the display interface, and `usbhid`
+binds the gamepad. No `new_id`, no kernel patches, no manual unbinds.
 
 The firmware also builds for plain ESP32-S3 boards (e.g. ESP32-S3 Super
 Mini) as a Bluetooth-HCI-only image — no LCD, no µSD, just the BLE
@@ -26,10 +30,10 @@ for hosts that don't have one or whose built-in radio is broken.
 
 ## Hardware support
 
-| Build env       | Board                | BT HCI | MSC (µSD) | GUD (LCD) |
-|-----------------|----------------------|:------:|:---------:|:---------:|
-| `t_dongle_s3`   | LilyGo T-Dongle S3   |   ✓    |     ✓     |     ✓     |
-| `super_mini`    | ESP32-S3 Super Mini  |   ✓    |     —     |     —     |
+| Build env       | Board                | BT HCI | MSC (µSD) | GUD (LCD) | HID (BOOT btn) |
+|-----------------|----------------------|:------:|:---------:|:---------:|:--------------:|
+| `t_dongle_s3`   | LilyGo T-Dongle S3   |   ✓    |     ✓     |     ✓     |       ✓        |
+| `super_mini`    | ESP32-S3 Super Mini  |   ✓    |     —     |     —     |       —        |
 
 Should work on any ESP32-S3 board with native USB on GPIO19/GPIO20
 under the `super_mini` env. The `t_dongle_s3` env hardcodes the
@@ -46,14 +50,19 @@ adapted from [notro/gud-pico](https://github.com/notro/gud-pico) (see
 
 ### USB layout — `t_dongle_s3` build
 
-Four interfaces, two IADs:
+Five interfaces, two IADs:
 
-| IF | Class                | Endpoints                  | Purpose                |
-|---:|----------------------|----------------------------|------------------------|
-|  0 | `0xE0/0x01/0x01`     | EP1 INT IN, EP2 BULK IN/OUT | BT HCI                 |
-|  1 | `0xE0/0x01/0x01`     | none                        | Dummy SCO (btusb quirk)|
-|  2 | `0x08/0x06/0x50`     | EP3 BULK IN/OUT             | MSC (SCSI BBB)         |
-|  3 | `0xFF/0x00/0x00`     | EP5 BULK OUT                | GUD vendor             |
+| IF | Class                | Endpoints                  | Purpose                 |
+|---:|----------------------|----------------------------|-------------------------|
+|  0 | `0xE0/0x01/0x01`     | EP1 INT IN, EP2 BULK IN/OUT | BT HCI                  |
+|  1 | `0xE0/0x01/0x01`     | none                        | Dummy SCO (btusb quirk) |
+|  2 | `0x08/0x06/0x50`     | EP3 BULK IN/OUT             | MSC (SCSI BBB)          |
+|  3 | `0xFF/0x00/0x00`     | EP5 BULK OUT                | GUD vendor              |
+|  4 | `0x03/0x00/0x00`     | EP4 INT IN                  | HID gamepad (1 button)  |
+
+Five IN endpoints (EP0 + EP1 + EP2 + EP3 + EP4) fills all five TX FIFOs
+the ESP32-S3 USB-OTG core provides — no further IN endpoints can be
+added on this build without dropping one.
 
 ### USB layout — `super_mini` build
 
@@ -75,8 +84,8 @@ so the HCI half works the same regardless. On `super_mini` there's no
 vendor interface, so `gud` simply doesn't bind — harmless.
 
 The `iManufacturer` / `iProduct` strings ("Espressif" / "ESP32-S3 BT HCI
-+ MSC + GUD" or "ESP32-S3 BT HCI") keep the device identifiable in
-`lsusb`.
++ MSC + GUD + HID" or "ESP32-S3 BT HCI") keep the device identifiable
+in `lsusb`.
 
 ### Why dummy SCO at IF1
 
@@ -105,17 +114,18 @@ Requires PlatformIO.
 pio run
 
 # Explicit env selection
-pio run -e t_dongle_s3       # full firmware (BT + MSC + GUD)
+pio run -e t_dongle_s3       # full firmware (BT + MSC + GUD + HID)
 pio run -e super_mini        # BT-only
 
 pio run -e t_dongle_s3 -t upload   # flash (see download mode below)
 ```
 
 The two envs differ only in the `BOARD_T_DONGLE_S3` / `BOARD_SUPER_MINI`
-build flag; `src/main.c`, `src/tusb_config.h`, `src/msc_sd.c`, and
-`src/gud/*.c` `#ifdef`-gate the function-specific code so the Super Mini
-binary doesn't pull in the SDMMC driver, the SPI panel driver, or the
-GUD class driver. Net result: ~96 KB smaller binary on Super Mini.
+build flag; `src/main.c`, `src/tusb_config.h`, `src/msc_sd.c`,
+`src/hid_button.c`, and `src/gud/*.c` `#ifdef`-gate the function-specific
+code so the Super Mini binary doesn't pull in the SDMMC driver, the SPI
+panel driver, the GUD class driver, or the HID class driver. Net result:
+~96 KB smaller binary on Super Mini.
 
 ## Flashing
 
@@ -184,8 +194,8 @@ USB layout above:
 ```sh
 # Verify the device enumerated
 lsusb | grep 1d50:614d
-# 1d50:614d ... ESP32-S3 BT HCI + MSC + GUD     (t_dongle_s3 build)
-# 1d50:614d ... ESP32-S3 BT HCI                 (super_mini build)
+# 1d50:614d ... ESP32-S3 BT HCI + MSC + GUD + HID   (t_dongle_s3 build)
+# 1d50:614d ... ESP32-S3 BT HCI                     (super_mini build)
 ```
 
 ### Bluetooth
@@ -231,6 +241,28 @@ connectors out of fbdev-emulation, so plug-in dmesg always shows `gud
 a bug). Use `/dev/dri/cardN` directly (modetest, libdrm) or
 `tools/draw-text.py` (libusb, bypasses the kernel driver entirely).
 
+### BOOT button (T-Dongle only)
+
+The dongle's BOOT button on GPIO0 is exposed as a one-button gamepad.
+Linux maps Generic Desktop / Game Pad / Button-1 usage to `BTN_A`
+(`BTN_GAMEPAD` / `BTN_SOUTH`):
+
+```sh
+# Watch presses (requires read access to /dev/input/eventN — typically
+# in the `input` group, or run as root)
+sudo evtest /dev/input/eventN          # press BOOT — see EV_KEY BTN_A 1/0
+
+# udev-readable joydev wrapper — works without root if your distro
+# ships /dev/input/jsN as world-readable
+jstest /dev/input/jsN
+```
+
+The button is debounced in firmware (20 ms hysteresis); reports are
+sent on transitions only, so there's no idle USB chatter. GPIO0 is also
+the chip's strapping pin — held low at reset triggers ROM download
+mode — so leaving it pressed during boot will drop you into the ROM
+bootloader instead of running firmware. Same as plain ESP32-S3 boards.
+
 ## Configuration
 
 Key settings in `sdkconfig.defaults`:
@@ -252,6 +284,7 @@ src/
   idf_component.yml  - Dependency on espressif/tinyusb
   msc_sd.{c,h}       - SDMMC slot 1 bridge to TinyUSB MSC class       [T-Dongle only]
   gud/               - Generic USB Display function and ST7735 panel  [T-Dongle only]
+  hid_button.{c,h}   - HID gamepad bridge for the BOOT button (GPIO0) [T-Dongle only]
 sdkconfig.defaults   - ESP-IDF Kconfig overrides
 platformio.ini       - PlatformIO project config (two envs: t_dongle_s3, super_mini)
 docs/                - design notes / known-bug writeups
