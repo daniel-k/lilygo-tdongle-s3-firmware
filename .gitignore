@@ -1,0 +1,7 @@
+.pio
+managed_components
+# Auto-generated per-env sdkconfig snapshots. Source of truth is sdkconfig.defaults.
+sdkconfig.*
+!sdkconfig.defaults
+dependencies.lock
+dmesg.log

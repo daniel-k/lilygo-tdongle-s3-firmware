@@ -1,0 +1,31 @@
+# Grant the local user direct access to the ESP32-S3 dongle, so
+# tools/reboot-download.py and `pio run -t upload` work without sudo.
+#
+# Covers:
+#   - running firmware: 1d50:614d (Openhardware.io / GUD USB Display PID,
+#     adopted so the kernel gud driver auto-binds without new_id),
+#   - ROM bootloader on USB-OTG: 303a:0009 (script-triggered path),
+#   - ROM bootloader on USB-Serial-JTAG: 303a:1001 (BOOT-button path),
+# plus any CDC tty the device exposes so esptool can open it for flashing.
+#
+# `uaccess` is the modern (systemd-logind) way; the GROUP/MODE fallback
+# covers setups where logind isn't applying ACLs or for non-seat sessions.
+# Adjust GROUP for your distro: `uucp` on Arch, `dialout` on Debian/Ubuntu,
+# `plugdev` on others. The user must be a member of that group.
+#
+# Install:
+#   sudo cp udev/80-esp32s3-hci-dev.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload
+#   sudo udevadm trigger
+#   # then replug the device
+
+SUBSYSTEM=="usb", ATTR{idVendor}=="1d50", ATTR{idProduct}=="614d", TAG+="uaccess", MODE="0660", GROUP="uucp"
+SUBSYSTEM=="usb", ATTR{idVendor}=="303a", TAG+="uaccess", MODE="0660", GROUP="uucp"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1d50", ATTRS{idProduct}=="614d", TAG+="uaccess", MODE="0660", GROUP="uucp"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="303a", TAG+="uaccess", MODE="0660", GROUP="uucp"
+
+# When a hub enumerates, grant uucp group access to its per-port disable
+# files so the dev workflow can VBUS-cycle the port hosting the dongle
+# without sudo. Runs as root.
+SUBSYSTEM=="usb", ATTR{bDeviceClass}=="09", \
+    RUN+="/bin/sh -c 'for f in /sys%p/*/*/disable; do [ -e \"$f\" ] && chmod 0660 \"$f\" && chgrp uucp \"$f\"; done'"
