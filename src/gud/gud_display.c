@@ -34,6 +34,7 @@
 
 #include "esp_log.h"
 #include "esp_check.h"
+#include "esp_heap_caps.h"
 #include "driver/spi_master.h"
 #include "driver/ledc.h"
 #include "esp_lcd_panel_io.h"
@@ -106,6 +107,36 @@ static void backlight_set(uint8_t duty)
     ledc_update_duty(BL_LEDC_MODE, BL_LEDC_CHANNEL);
 }
 
+/* Fill panel GRAM with white before DISPON so a quick power-cycle never
+ * shows leftover RAM contents. RGB565 white is 0xFFFF, byte-swap-symmetric,
+ * so memset(0xFF) works in either byte order. */
+static void clear_panel_white(void)
+{
+    uint8_t *buf = heap_caps_malloc(GUD_FRAMEBUFFER_BYTES,
+                                    MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    if (!buf) {
+        ESP_LOGW(TAG, "clear_panel_white: alloc failed; skipping");
+        return;
+    }
+    memset(buf, 0xFF, GUD_FRAMEBUFFER_BYTES);
+
+    xSemaphoreTake(s_spi_done, portMAX_DELAY);
+    esp_err_t err = esp_lcd_panel_draw_bitmap(s_panel, 0, 0,
+                                              GUD_DISPLAY_WIDTH,
+                                              GUD_DISPLAY_HEIGHT, buf);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "clear_panel_white draw failed: %s", esp_err_to_name(err));
+        xSemaphoreGive(s_spi_done);
+        heap_caps_free(buf);
+        return;
+    }
+    /* Wait for DMA to drain so the buffer is safe to free, then restore
+     * the "given" state for write_buffer_cb's first take. */
+    xSemaphoreTake(s_spi_done, portMAX_DELAY);
+    xSemaphoreGive(s_spi_done);
+    heap_caps_free(buf);
+}
+
 void gud_display_panel_init(void)
 {
     s_spi_done = xSemaphoreCreateBinary();
@@ -136,6 +167,8 @@ void gud_display_panel_init(void)
     ESP_ERROR_CHECK(esp_lcd_panel_init(s_panel));
     ESP_ERROR_CHECK(esp_lcd_panel_invert_color(s_panel, true));
     ESP_ERROR_CHECK(esp_lcd_panel_set_gap(s_panel, 26, 1));
+
+    clear_panel_white();
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, true));
 
     s_panel_ready = true;
